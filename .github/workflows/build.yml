@@ -31,7 +31,7 @@ jobs:
           ref: v1.15.0-alpha.13
           path: sing-box
 
-      # 3. 安装 Java
+      # 3. 安装 Java 17
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -44,7 +44,7 @@ jobs:
         with:
           go-version: '1.26.10'
 
-      # 5. 配置 Android SDK
+      # 5. 配置 Android SDK 环境
       - name: Configure Android SDK
         run: |
           echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
@@ -52,7 +52,7 @@ jobs:
           echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "/usr/local/lib/android/sdk/platform-tools" >> "$GITHUB_PATH"
 
-      # 6. 安装 SDK 和 NDK
+      # 6. 安装 Android SDK 和 NDK
       - name: Install Android SDK packages
         run: |
           yes | sdkmanager --licenses
@@ -64,11 +64,16 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
 
-      # 7. 延长 Gradle 下载超时
+      # 7. 延长 Gradle Wrapper 下载超时
       - name: Increase Gradle Wrapper download timeout
         run: |
-          echo "networkTimeout=120000" >> sing-box-for-android/gradle/wrapper/gradle-wrapper.properties
-          cat sing-box-for-android/gradle/wrapper/gradle-wrapper.properties
+          FILE="sing-box-for-android/gradle/wrapper/gradle-wrapper.properties"
+          if grep -q '^networkTimeout=' "$FILE"; then
+            sed -i 's/^networkTimeout=.*/networkTimeout=120000/' "$FILE"
+          else
+            echo "networkTimeout=120000" >> "$FILE"
+          fi
+          cat "$FILE"
 
       # 8. 安装 gomobile
       - name: Install gomobile
@@ -77,20 +82,41 @@ jobs:
           make lib_install
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      # 9. 编译 sing-box Android 核心库
+      # 9. 创建 SFA 的 libbox 目标目录
+      - name: Prepare libbox directory
+        run: |
+          mkdir -p sing-box-for-android/app/libs
+          ls -la sing-box-for-android/app/libs
+
+      # 10. 编译 sing-box Android 核心库
       - name: Build libbox Android libraries
         working-directory: sing-box
         run: |
           make lib_android
 
-      # 10. 编译 SFA APK
+      # 11. 检查核心库是否成功生成
+      - name: Verify libbox AAR files
+        run: |
+          set -e
+          test -f sing-box-for-android/app/libs/libbox.aar
+          test -f sing-box-for-android/app/libs/libbox-legacy.aar
+          ls -lh sing-box-for-android/app/libs/
+
+      # 12. 编译 SFA APK
       - name: Build SFA APK
         working-directory: sing-box-for-android
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon :app:assembleOtherDebug
 
-      # 11. 上传 APK
+      # 13. 检查 APK 是否生成
+      - name: Verify APK
+        run: |
+          set -e
+          ls -lh sing-box-for-android/app/build/outputs/apk/other/debug/
+          test -n "$(find sing-box-for-android/app/build/outputs/apk/other/debug/ -name '*.apk' -type f)"
+
+      # 14. 上传 APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
