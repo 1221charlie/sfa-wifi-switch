@@ -53,7 +53,7 @@ jobs:
           sdkmanager --licenses
           sdkmanager \
             "platform-tools" \
-            "platforms;android-37" \
+            "platforms;android-37.0" \
             "build-tools;37.0.0" \
             "ndk;28.0.13004108"
 
