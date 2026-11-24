@@ -30,6 +30,15 @@ jobs:
           repository: SagerNet/sing-box
           ref: v1.15.0-alpha.13
           path: sing-box
+      - name: Checkout patch files
+        uses: actions/checkout@v4
+        with:
+          path: patch-src
+
+      - name: Apply Wi-Fi auto switch patch
+        env:
+          WIFI_SSID: ${{ vars.WIFI_SSID }}
+        run: python3 patch-src/apply_wifi_patch.py
 
       # 3. 安装 Java 17
       - name: Setup Java
