@@ -1,0 +1,312 @@
+package io.nekohasekai.sfa.wifiswitch
+
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.database.Cursor
+import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.IBinder
+import android.os.SystemClock
+import android.util.Log
+import androidx.core.content.ContextCompat
+import io.nekohasekai.sfa.bg.BoxService
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * 常驻前台服务：监听 Wi-Fi。
+ * 连上目标 Wi-Fi -> BoxService.stop()；离开目标 Wi-Fi -> BoxService.start()。
+ * 通知栏会显示当前读到的 Wi-Fi 状态、定位权限状态和上次动作，方便排查。
+ */
+class WifiAutoSwitchService : Service() {
+
+    companion object {
+        const val TARGET_SSID = "__WIFI_SSID__"
+
+        // 目标值是形如 192.168.10.1 的 IPv4 地址时，按“路由器网关地址”识别，不需要定位权限
+        val GATEWAY_MODE: Boolean =
+            TARGET_SSID.count { it == '.' } == 3 && TARGET_SSID.all { it.isDigit() || it == '.' }
+        private const val TAG = "WifiAutoSwitch"
+        private const val CHANNEL_ID = "wifi_auto_switch"
+        private const val NOTIFICATION_ID = 787801
+        private const val POLL_MS = 3000L
+        private const val STABLE_MS = 2500L
+
+        private const val NONE = -2
+        private const val UNKNOWN = -1
+        private const val OTHER = 0
+        private const val TARGET = 1
+
+        fun ensureStarted(context: Context) {
+            if (TARGET_SSID.isEmpty()) return
+            try {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, WifiAutoSwitchService::class.java),
+                )
+            } catch (e: Throwable) {
+                Log.w(TAG, "cannot start monitor service", e)
+            }
+        }
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val kick = Channel<Unit>(Channel.CONFLATED)
+    private var callback: ConnectivityManager.NetworkCallback? = null
+
+    private var lastSeen = NONE
+    private var stateSince = 0L
+    private var applied = NONE
+    private var lastAction = "无"
+    private var lastText = ""
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+    override fun onCreate() {
+        super.onCreate()
+        goForeground("启动中…")
+        registerCallback()
+        scope.launch { loop() }
+    }
+
+    override fun onDestroy() {
+        try {
+            callback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
+        } catch (_: Throwable) {
+        }
+        callback = null
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    // ---------- 通知 ----------
+
+    private fun buildNotification(text: String): Notification {
+        return Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("Wi-Fi auto switch")
+            .setContentText(text.lineSequence().first())
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+    }
+
+    private fun goForeground(text: String) {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "Wi-Fi auto switch", NotificationManager.IMPORTANCE_MIN),
+        )
+        val notification = buildNotification(text)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun mark(ok: Boolean) = if (ok) "✓" else "✗"
+
+    private fun updateNotification(state: Int, id: String?) {
+        val fine = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val bg = checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val locOn = try {
+            getSystemService(LocationManager::class.java).isLocationEnabled
+        } catch (_: Throwable) {
+            false
+        }
+        val stateText = when (state) {
+            TARGET -> "已连接目标 Wi-Fi"
+            OTHER -> when {
+                id == null -> "未连接 Wi-Fi"
+                GATEWAY_MODE -> "其他 Wi-Fi，网关 $id"
+                else -> "其他 Wi-Fi: $id"
+            }
+            else -> if (GATEWAY_MODE) "无法读取网关地址" else "无法读取 Wi-Fi 名称"
+        }
+        val permLine = if (GATEWAY_MODE) {
+            ""
+        } else {
+            "\n定位权限: 精确" + mark(fine) + " 始终允许" + mark(bg) + " 系统定位开关" + mark(locOn)
+        }
+        val text = stateText + permLine +
+            "\n上次动作: " + lastAction +
+            "\n监听目标: " + TARGET_SSID + (if (GATEWAY_MODE) "（网关识别，无需定位）" else "")
+        if (text == lastText) return
+        lastText = text
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    // ---------- 监听 ----------
+
+    private fun registerCallback() {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                kick.trySend(Unit)
+            }
+
+            override fun onLost(network: Network) {
+                kick.trySend(Unit)
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                kick.trySend(Unit)
+            }
+        }
+        callback = cb
+        cm.registerNetworkCallback(request, cb)
+    }
+
+    private suspend fun loop() {
+        while (true) {
+            try {
+                evaluate()
+            } catch (e: Throwable) {
+                Log.w(TAG, "evaluate failed", e)
+            }
+            withTimeoutOrNull(POLL_MS) { kick.receive() }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isWifiUp(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        return cm.allNetworks.any { n ->
+            val c = cm.getNetworkCapabilities(n)
+            c != null &&
+                c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                c.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun readSsid(): String? {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val raw = wm.connectionInfo?.ssid ?: return null
+        val s = raw.removeSurrounding("\"")
+        return if (s.isEmpty() || s == WifiManager.UNKNOWN_SSID) null else s
+    }
+
+    @Suppress("DEPRECATION")
+    private fun readGateway(): String? {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        for (n in cm.allNetworks) {
+            val c = cm.getNetworkCapabilities(n) ?: continue
+            if (!c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) continue
+            if (!c.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
+            val lp = cm.getLinkProperties(n) ?: continue
+            for (r in lp.routes) {
+                val gw = r.gateway
+                if (r.isDefaultRoute && gw is java.net.Inet4Address) return gw.hostAddress
+            }
+        }
+        return null
+    }
+
+    private fun evaluate() {
+        val wifiUp = isWifiUp()
+        val id = if (!wifiUp) null else if (GATEWAY_MODE) readGateway() else readSsid()
+        val state = when {
+            !wifiUp -> OTHER
+            id == null -> UNKNOWN
+            id == TARGET_SSID -> TARGET
+            else -> OTHER
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (state != lastSeen) {
+            lastSeen = state
+            stateSince = now
+        }
+        // 状态稳定一小段时间后才执行动作，避免切换瞬间误触发
+        if (state != UNKNOWN && state != applied && now - stateSince >= STABLE_MS) {
+            apply(state)
+            applied = state
+        }
+        updateNotification(state, id)
+    }
+
+    private fun apply(state: Int) {
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        try {
+            if (state == TARGET) {
+                BoxService.stop()
+                lastAction = "$time 已发送关闭 VPN"
+                Log.i(TAG, "stop VPN")
+            } else if (state == OTHER && applied == TARGET) {
+                BoxService.start()
+                lastAction = "$time 已发送开启 VPN"
+                Log.i(TAG, "start VPN")
+            }
+        } catch (e: Throwable) {
+            lastAction = "$time 失败: " + e.javaClass.simpleName
+            Log.w(TAG, "apply failed", e)
+        }
+    }
+}
+
+/** 开机 / 应用更新后拉起监听服务。 */
+class WifiAutoSwitchReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        WifiAutoSwitchService.ensureStarted(context)
+    }
+}
+
+/** 应用进程一启动就拉起监听服务（不用改 SFA 的 Application 代码）。 */
+class WifiAutoSwitchProvider : ContentProvider() {
+    override fun onCreate(): Boolean {
+        context?.let { WifiAutoSwitchService.ensureStarted(it) }
+        return true
+    }
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?,
+    ): Cursor? = null
+
+    override fun getType(uri: Uri): String? = null
+
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+    override fun update(
+        uri: Uri,
+        values: ContentValues?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+    ): Int = 0
+}
