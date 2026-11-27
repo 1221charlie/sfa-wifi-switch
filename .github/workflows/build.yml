@@ -111,6 +111,17 @@ jobs:
           test -f sing-box-for-android/app/libs/libbox-legacy.aar
           ls -lh sing-box-for-android/app/libs/
 
+      - name: Install fixed debug keystore
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_B64" ]; then
+            echo "未设置 DEBUG_KEYSTORE_B64，使用临时签名"
+          else
+            mkdir -p ~/.android
+            echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+            keytool -list -keystore ~/.android/debug.keystore -storepass android
+          fi
       # 12. 编译 SFA APK
       - name: Build SFA APK
         working-directory: sing-box-for-android
